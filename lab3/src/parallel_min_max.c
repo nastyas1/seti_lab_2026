@@ -10,15 +10,30 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 
+#include <signal.h>
+
 #include <getopt.h>
 
 #include "find_min_max.h"
 #include "utils.h"
 
+pid_t *child_pids = NULL;
+int pnum_global = 0;
+
+void on_alarm(int sig) {
+  write(1, "ALARM\n", 6);
+  for (int i = 0; i < pnum_global; i++) {
+    if (child_pids[i] > 0) {
+      kill(child_pids[i], SIGKILL);
+    }
+  }
+}
+
 int main(int argc, char **argv) {
   int seed = -1;
   int array_size = -1;
   int pnum = -1;
+  int timeout = -1;
   bool with_files = false;
 
   while (true) {
@@ -27,6 +42,7 @@ int main(int argc, char **argv) {
     static struct option options[] = {{"seed", required_argument, 0, 0},
                                       {"array_size", required_argument, 0, 0},
                                       {"pnum", required_argument, 0, 0},
+                                      {"timeout", required_argument, 0, 0},
                                       {"by_files", no_argument, 0, 'f'},
                                       {0, 0, 0, 0}};
 
@@ -60,6 +76,13 @@ int main(int argc, char **argv) {
             }
             break;
           case 3:
+            timeout = atoi(optarg);
+            if (timeout <= 0) {
+              printf("Ошибка: timeout должен быть положительным числом\n");
+              return 1;
+            }
+            break;
+          case 4:
             with_files = true;
             break;
 
@@ -91,13 +114,34 @@ int main(int argc, char **argv) {
   }
 
   int *array = malloc(sizeof(int) * array_size);
+  if (array == NULL) {
+    printf("malloc failed\n");
+    return 1;
+  }
   GenerateArray(array, array_size, seed);
   int active_child_processes = 0;
 
-  // ИСПРАВЛЕНИЕ ОШИБКИ 1: Объявляем размер шага для подмассивов
   int sub_array_size = array_size / pnum;
 
-  // ИСПРАВЛЕНИЕ ОШИБКИ 2: Создаем массив каналов (pipes) для межпроцессного взаимодействия
+  child_pids = malloc(sizeof(pid_t) * pnum);
+  if (child_pids == NULL) {
+    printf("malloc failed\n");
+    free(array);
+    return 1;
+  }
+  for (int i = 0; i < pnum; i++) child_pids[i] = 0;
+  pnum_global = pnum;
+
+  if (timeout > 0) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_alarm;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGALRM, &sa, NULL);
+    alarm(timeout);
+  }
+
   int (*pipes)[2] = NULL;
   if (!with_files) {
     pipes = malloc(sizeof(int[2]) * pnum);
@@ -119,17 +163,15 @@ int main(int argc, char **argv) {
       active_child_processes += 1;
       if (child_pid == 0) {
         // child process
-        // Определяем индексы подмассива для текущего процесса
+        sleep(5); // <--- ДОБАВЛЕНО ДЛЯ ПРОВЕРКИ
         int start_index = i * sub_array_size;
         int end_index = (i == pnum - 1) ? array_size : (i + 1) * sub_array_size;
 
-        // Ищем минимум и максимум в своем кусочке (функция из find_min_max.h)
         struct MinMax min_max = GetMinMax(array, start_index, end_index);
 
         // parallel somehow
 
         if (with_files) {
-          // Логика записи в файл: создаем уникальный файл для процесса
           char file_name[64];
           sprintf(file_name, "ch_%d.txt", i);
           FILE *f = fopen(file_name, "w");
@@ -138,19 +180,19 @@ int main(int argc, char **argv) {
             fprintf(f, "%d %d", min_max.min, min_max.max);
             fclose(f);        
           } 
-        } // ИСПРАВЛЕНИЕ ОШИБКИ 3: Добавлена закрывающая скобка для блока if (with_files)
+        }
         else 
         {
-          // use pipe here
-          // Логика записи в pipe
-          close(pipes[i][0]); // Закрываем чтение (дочерний только пишет)
+          close(pipes[i][0]);
           write(pipes[i][1], &min_max, sizeof(struct MinMax));
-          close(pipes[i][1]); // Закрываем запись после отправки
+          close(pipes[i][1]);
         }
         free(array);
         if (!with_files) free(pipes);
         exit(0);
       }
+
+      child_pids[i] = child_pid;
 
     } else {
       printf("Fork failed!\n");
@@ -159,10 +201,11 @@ int main(int argc, char **argv) {
   }
 
   while (active_child_processes > 0) {
-    // your code here
     wait(NULL);
     active_child_processes -= 1;
   }
+
+  alarm(0);
 
   struct MinMax min_max;
   min_max.min = INT_MAX;
@@ -173,7 +216,6 @@ int main(int argc, char **argv) {
     int max = INT_MIN;
 
     if (with_files) {
-      // read from files
       char file_name[64];
       sprintf(file_name, "ch_%d.txt", i);
       FILE *f = fopen(file_name, "r");
@@ -183,11 +225,10 @@ int main(int argc, char **argv) {
         remove(file_name);
       }
     } else {
-      // read from pipes
       struct MinMax local_res;
-      close(pipes[i][1]); // Закрываем запись (родитель только читает)
+      close(pipes[i][1]);
       read(pipes[i][0], &local_res, sizeof(struct MinMax));
-      close(pipes[i][0]); // Закрываем чтение после получения данных
+      close(pipes[i][0]);
       min = local_res.min;
       max = local_res.max;
     }
@@ -203,6 +244,7 @@ int main(int argc, char **argv) {
   elapsed_time += (finish_time.tv_usec - start_time.tv_usec) / 1000.0;
 
   free(array);
+  free(child_pids);
   if (!with_files) free(pipes);
 
   printf("Min: %d\n", min_max.min);
